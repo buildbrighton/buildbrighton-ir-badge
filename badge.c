@@ -18,6 +18,7 @@
 #include <avr/eeprom.h>
 
 #include "badge.h"
+//#include "trippyrgb.h"
 
 uint8_t last_eeprom_read = 1;
 uint8_t enable_rgb_led = 1;
@@ -64,7 +65,11 @@ void disable_ir_recving(void) {
 void mark(int time) {
   // Sends an IR mark for the specified number of microseconds.
   // The mark output is modulated at the PWM frequency.
+#ifdef TRIPPY_RGB_WAVE
+  GTCCR |= _BV(COM0A0);  // turn on OC0A PWM output
+#else
   GTCCR |= _BV(COM1B0);  // turn on OC1B PWM output
+#endif
   delay_ten_us(time / 10);
 }
 
@@ -72,18 +77,36 @@ void mark(int time) {
 void space(int time) {
   // Sends an IR space for the specified number of microseconds.
   // A space is no output, so the PWM output is disabled.
-  GTCCR &= ~(_BV(COM1B0));  // turn on OC1B PWM output
+#ifdef TRIPPY_RGB_WAVE
+  GTCCR &= ~(_BV(COM0A0));  // turn off OC0A PWM output
+#else
+  GTCCR &= ~(_BV(COM1B0));  // turn off OC1B PWM output
+#endif
   delay_ten_us(time / 10);
 }
 
 void enableIROut(void) {
 
+#ifdef TRIPPY_RGB_WAVE
+  TCCR0A = 0b01000010;  // COM0A1:0=01 to toggle OC0A on Compare Match
+                            // COM0B1:0=00 to disconnect OC0B
+                            // bits 3:2 are unused
+                            // WGM01:00=10 for CTC Mode (WGM02=0 in TCCR0B)
+  TCCR0B = 0b00000001;  // FOC0A=0 (no force compare)
+                              // F0C0B=0 (no force compare)
+                              // bits 5:4 are unused
+                              // WGM2=0 for CTC Mode (WGM01:00=10 in TCCR0A)
+                              // CS02:00=001 for divide by 1 prescaler (this starts Timer0)
+  OCR0A = 104;  // to output 38,095.2KHz on OC0A (PB0, pin 5)
+
+#else
   TCCR1 = _BV(CS10);  // turn on clock, prescale = 1
   GTCCR = _BV(PWM1B) | _BV(COM1B0);  // toggle OC1B on compare match; PWM mode on OCR1C/B.
-
-  // these two values give 38khz PWM on IR LED, with 33%ish duty cycle
+  // these two values give 38khz PWM on IR LED (OC1B == PB4 == pin3),
+  // with 33%ish duty cycle
   OCR1C = 210;
   OCR1B = 70;
+#endif
 
 }
 
@@ -385,7 +408,6 @@ ISR(TIMER0_OVF_vect) {
       if (irparams.irdata == SPACE) {  // got a SPACE, check stop MARK time
         if ((irparams.timer >= BITMARKMIN) && (irparams.timer <= BITMARKMAX)) {
           // time OK -- got an IR code
-          //FLASH_RED;
           irparams.irbuf[irparams.fptr] = irparams.ircode ;   // store code at fptr position
           irparams.fptr = (irparams.fptr + 1) % MAXBUF ; // move fptr to next empty slot
         }
@@ -542,16 +564,27 @@ void check_all_ir_buffers_for_data(void) {
 
         if (IRBUF_CUR) {
 
-            if ( ( IRBUF_CUR & ~COMMON_CODE_MASK ) == APPLE_PREV_TRACK ) {
-                // display our current id (by flashing binary blue/red on LED)
-                flash_byte(my_id);
+            if ( (IRBUF_CUR & COMMON_CODE_MASK) == (long)(OUR_COMMON_CODE)<<24) {
+                // we got a BB Badge code, process it.
+                process_badge_message(IRBUF_CUR);
 
-            } else if ( ( IRBUF_CUR & ~COMMON_CODE_MASK ) == APPLE_NEXT_TRACK ) {
+            } else if ( ( IRBUF_CUR & ~COMMON_CODE_MASK ) == APPLE_PREV_TRACK ) { // DISPLAY ID
+                // display our current id (by flashing binary blue/red on LED)
+		            if ( my_mode != INIT_MODE ) {
+	                  eeprom_write_byte((uint8_t*)0, curr_colour);
+		                FLASH_GREEN;
+		            } 
+                factory_reset_keycombo_count = 0;
+
+            } else if ( ( IRBUF_CUR & ~COMMON_CODE_MASK ) == APPLE_NEXT_TRACK ) { // REFLECT COLOUR MODE
                 // turn'em off, n sync-ish em up.
                 enable_rgb_led = 1;
-                my_mode = REFLECT_COLOUR;
+                if ( my_mode != INIT_MODE ) {
+		                my_mode = REFLECT_COLOUR;
+		            }
+                factory_reset_keycombo_count = 0;
 
-            } else if ( ( IRBUF_CUR & ~COMMON_CODE_MASK ) == APPLE_VOLUME_UP ) {
+            } else if ( ( IRBUF_CUR & ~COMMON_CODE_MASK ) == APPLE_VOLUME_UP ) { // TOGGLE LED DISPLA
                 // turn'em off, n sync-ish em up.
                 if ( factory_reset_keycombo_count == 3 ) { 
                     FLASH_RED;
@@ -562,41 +595,54 @@ void check_all_ir_buffers_for_data(void) {
                     enable_rgb_led = enable_rgb_led ? 0 : 1;
                 }
 
-            } else if ( ( IRBUF_CUR & ~COMMON_CODE_MASK ) == APPLE_VOLUME_DOWN ) {
+            } else if ( ( IRBUF_CUR & ~COMMON_CODE_MASK ) == APPLE_VOLUME_DOWN ) { // CYCLE COLOURS MODE
                 // turn'em off, n sync-ish em up.
                 if ( factory_reset_keycombo_count == 2 ) { 
-                    enable_rgb_led = 0;
+                    //enable_rgb_led = 0;
                     FLASH_RED;
                     factory_reset_keycombo_count++;
                 } else {
-                    FLASH_GREEN;
-                    enable_rgb_led = 1;
-                    my_mode = CYCLE_COLOURS_SEEN;
-                    curr_colour = 0;
+                    if ( my_mode != INIT_MODE ) {
+                        FLASH_GREEN;
+                        enable_rgb_led = 1;
+                        my_mode = CYCLE_COLOURS_SEEN;
+                        curr_colour = 0;
+                    }
                     factory_reset_keycombo_count = 0;
                 }
 
-            } else if ( ( IRBUF_CUR & ~COMMON_CODE_MASK ) == APPLE_PLAY ) {
-                // zombie 'em up
+            } else if ( ( IRBUF_CUR & ~COMMON_CODE_MASK ) == APPLE_PLAY ) { // INFECT! (or set badge ID)
+                if ( my_mode == INIT_MODE ) {
+                    // set id to current colour
+                    eeprom_write_byte((uint8_t*)0, curr_colour);
+                    // show that we've done this
+                    FLASH_BLUE; delay_ten_us(1000);
+                    FLASH_GREEN; delay_ten_us(1000);
+                    FLASH_BLUE; delay_ten_us(1000);
+                    FLASH_GREEN; delay_ten_us(1000);
+                }
                 if ( factory_reset_keycombo_count == 0 
                         || factory_reset_keycombo_count == 1 
                         || factory_reset_keycombo_count == 4 ) {
-                    enable_rgb_led = 0;
+                    //enable_rgb_led = 0;
                     FLASH_RED;
                     factory_reset_keycombo_count++;
                 } else {
-                    my_mode = AM_INFECTED;
-                    enable_rgb_led = 1;
-                    factory_reset_keycombo_count = 0;
+                    // infect!
+                    if ( my_mode != INIT_MODE ) {
+                        my_mode = AM_INFECTED;
+                        enable_rgb_led = 1;
+                        time_infected = main_loop_counter;
+                        factory_reset_keycombo_count = 0;
+                    } else {
+                    }
                 }
 
-            } else if ( ( IRBUF_CUR & ~COMMON_CODE_MASK ) == APPLE_MENU ) {
+            } else if ( ( IRBUF_CUR & ~COMMON_CODE_MASK ) == APPLE_MENU ) { // SEND EEPROM DATA
                 // go into data transfer mode - IR all known info to a receiving station
                 my_mode = SEND_ALL_EEPROM;
                 factory_reset_keycombo_count = 0;
 
-            } else if ( (IRBUF_CUR & COMMON_CODE_MASK) == (long)(OUR_COMMON_CODE)<<24) {
-                process_badge_message(IRBUF_CUR);
             }
 
             IRBUF_CUR = 0; // processed this code, delete it.
@@ -636,8 +682,15 @@ uint8_t get_next_colour() {
 }
 
 void factory_reset(void) {
+    // blank all EEPROM (to 0xff)
     for (uint8_t i=0; i<1; i++) { 
-        eeprom_write_byte((uint8_t*)i, 0xff); // ensure we're in our own colour db
+        FLASH_RED;
+        delay_ten_us(100);
+        FLASH_GREEN;
+        delay_ten_us(100);
+        FLASH_BLUE;
+        delay_ten_us(100);
+        eeprom_write_byte((uint8_t*)i, 0xff);
         my_mode = INIT_MODE;
         enable_rgb_led = 1;
     }
@@ -654,7 +707,8 @@ void update_my_state(int counter) {
 
     if ( my_mode == AM_INFECTED ) {
         // yikes. 
-        curr_colour = ( main_loop_counter % 2 ) ? 0 : 81;
+        //curr_colour = ( main_loop_counter % 2 ) ? 0 : 81;
+        curr_colour = ( counter % 10 > 5 ) ? 0 : 81;
         if ( (main_loop_counter - time_infected) > MAX_TIME_INFECTED ) {
             // you die
             my_mode = AM_ZOMBIE;
@@ -662,8 +716,9 @@ void update_my_state(int counter) {
 
     } else if ( my_mode == AM_ZOMBIE ) {
         // hnnnngggg... brains...
-        //
-        curr_colour = ( main_loop_counter % 3 ) ? 0 : 1;
+        // TODO: Make this more ugly slow pulsing rather than flashing.
+        curr_colour = ( counter % 20 > 10 ) ? 0 : 1;
+        curr_colour = ( main_loop_counter % 2 ) ? 0 : 1;
 
     } else if ( my_mode == CYCLE_COLOURS_SEEN ) {
         curr_colour = get_next_colour();
@@ -677,8 +732,8 @@ void update_my_state(int counter) {
             eeprom_write_byte((uint8_t*) my_id, 1); // ensure we're in our own colour db
             my_mode = CYCLE_COLOURS_SEEN;
         } else {
-            // cycle red, green, blue: so we can double check RGB LED is soldered correctly.
-            curr_colour = rgb_colours[main_loop_counter % 3];
+	          // display a bunch of colours, so we can select one
+            curr_colour = (curr_colour + 7) % 240;
         }
     }
 
@@ -687,7 +742,9 @@ void update_my_state(int counter) {
         // converts to RGB 0x0 - & LEDs off.
         HSVtoRGB(&curr_r, &curr_g, &curr_b, 0, 0, 0);
     } else {
-        HSVtoRGB(&curr_r, &curr_g, &curr_b, (curr_colour - 1), 255, 255);
+	//int v = (16*((counter % 15)+2) - 1); // 32-255 in blocks of 16
+	int v = 255;
+        HSVtoRGB(&curr_r, &curr_g, &curr_b, (curr_colour - 1), 255, v);
     }
 
 }
@@ -733,7 +790,6 @@ int main(void) {
 
         disable_ir_recving();
         enableIROut();
-        //FLASH_BLUE;
 
 #ifndef DISABLE_EEPROM_SENDING_CODE
         if ( my_mode == SEND_ALL_EEPROM ) {
@@ -742,25 +798,26 @@ int main(void) {
             delay_ten_us(10000);
             // first byte of EEPROM is my_id
             for ( uint8_t i = 1; i < EEPROM_SIZE - 1 ; i++ ) {
+                FLASH_BLUE;
                 uint8_t data = eeprom_read_byte((uint8_t*)i);
                 if ( (data > 0) && (data < 255) ) {
                     sendNEC( (long)(OUR_COMMON_CODE)<<24 | (long)(i)<<8 | data );
-                    delay_ten_us(10000);
+                    delay_ten_us(EEPROM_SEND_DELAY);
                 }
             }
             sendNEC( MY_CODE_HEADER | (long)(SEND_ALL_EEPROM)<<8 | 0xFF); // footer
-            delay_ten_us(10000);
+            delay_ten_us(EEPROM_SEND_DELAY);
         }
 #endif
 
         my_code  = MY_CODE_HEADER | (long)(my_mode) <<8 | curr_colour;
 
 #ifndef DISABLE_IR_SENDING_CODE
-        for (uint8_t i=0; i<NUM_SENDS; i++) {
-           // transmit our identity, without interruption
-           sendNEC(my_code);  // takes ~68ms
-           //delay_ten_us(3280); // delay for 32ms
-           //FLASH_RED;
+        if ( my_mode != INIT_MODE ) {
+          for (uint8_t i=0; i<NUM_SENDS; i++) {
+            // transmit our identity, without interruption
+            sendNEC(my_code);  // takes ~68ms
+          }
         }
 #endif
 
@@ -768,13 +825,16 @@ int main(void) {
         enable_ir_recving();
 
         // loop a number of times, to have ~1s of recving/game logic
+        int j = 0;
         for (int i=0; i<730; i++) {
 
             check_all_ir_buffers_for_data();
 
-            //if ( i == 0 ) {
             if ( i % 73 == 0 ) {
-                update_my_state( (i*256/730) );
+                // every so often (10 times per secondish, 
+                //  update the mode we're in, colour we're showing)
+                update_my_state(j);
+     	          j++;
             }
 
             delay_ten_us(92 + (my_id % 16));  // differ sleep period so devices are less likely to interfere
